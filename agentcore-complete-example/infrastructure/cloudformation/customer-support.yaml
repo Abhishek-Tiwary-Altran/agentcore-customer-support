@@ -1,0 +1,666 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Complete Customer Support Infrastructure for AgentCore Example"
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: "agentcore-example"
+    Description: "Environment name for resource naming"
+
+Resources:
+  # DynamoDB Table for Customer Profiles
+  CustomerProfileTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${EnvironmentName}-customer-profiles"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: customer_id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+        - AttributeName: phone
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customer_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: phone-index
+          KeySchema:
+            - AttributeName: phone
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Application
+          Value: !Ref EnvironmentName
+        - Key: Component
+          Value: CustomerSupport
+
+  # DynamoDB Table for Warranty Information
+  WarrantyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${EnvironmentName}-warranties"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: serial_number
+          AttributeType: S
+        - AttributeName: customer_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: serial_number
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: customer-index
+          KeySchema:
+            - AttributeName: customer_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Application
+          Value: !Ref EnvironmentName
+        - Key: Component
+          Value: CustomerSupport
+
+  # DynamoDB Table for Order Information
+  OrderTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${EnvironmentName}-orders"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: order_id
+          AttributeType: S
+        - AttributeName: customer_id
+          AttributeType: S
+        - AttributeName: order_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: order_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: customer-orders-index
+          KeySchema:
+            - AttributeName: customer_id
+              KeyType: HASH
+            - AttributeName: order_date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Application
+          Value: !Ref EnvironmentName
+        - Key: Component
+          Value: CustomerSupport
+
+  # IAM Role for Lambda Functions
+  CustomerSupportLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-customer-support-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt CustomerProfileTable.Arn
+                  - !GetAtt WarrantyTable.Arn
+                  - !GetAtt OrderTable.Arn
+                  - !Sub "${CustomerProfileTable.Arn}/index/*"
+                  - !Sub "${WarrantyTable.Arn}/index/*"
+                  - !Sub "${OrderTable.Arn}/index/*"
+      Tags:
+        - Key: Application
+          Value: !Ref EnvironmentName
+        - Key: Component
+          Value: CustomerSupport
+
+  # Customer Support Lambda Function
+  CustomerSupportLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${EnvironmentName}-customer-support"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt CustomerSupportLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          CUSTOMER_PROFILE_TABLE_NAME: !Ref CustomerProfileTable
+          WARRANTY_TABLE_NAME: !Ref WarrantyTable
+          ORDER_TABLE_NAME: !Ref OrderTable
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import re
+          from datetime import datetime, timedelta
+          from botocore.exceptions import ClientError
+          import logging
+          from decimal import Decimal
+
+          # Setup logging
+          logging.basicConfig(
+              format="[%(asctime)s] p%(process)s {%(filename)s:%(lineno)d} %(levelname)s - %(message)s",
+              level=logging.INFO,
+          )
+          logger = logging.getLogger(__name__)
+
+          # Initialize DynamoDB resource
+          dynamodb = boto3.resource("dynamodb")
+
+          # Get table names from environment variables
+          CUSTOMER_PROFILE_TABLE_NAME = os.environ.get("CUSTOMER_PROFILE_TABLE_NAME")
+          WARRANTY_TABLE_NAME = os.environ.get("WARRANTY_TABLE_NAME")
+          ORDER_TABLE_NAME = os.environ.get("ORDER_TABLE_NAME")
+
+          def get_named_parameter(event, name):
+              """Get named parameter from event"""
+              return event.get(name)
+
+          def get_customer_profile(customer_id=None, email=None, phone=None):
+              """Get customer profile information"""
+              try:
+                  table = dynamodb.Table(CUSTOMER_PROFILE_TABLE_NAME)
+                  
+                  customer_item = None
+                  search_method = ""
+
+                  # Search by customer_id (primary key)
+                  if customer_id:
+                      search_method = "Customer ID"
+                      response = table.get_item(Key={"customer_id": customer_id.upper()})
+                      if "Item" in response:
+                          customer_item = response["Item"]
+
+                  # Search by email using GSI
+                  elif email:
+                      search_method = "Email"
+                      response = table.query(
+                          IndexName="email-index",
+                          KeyConditionExpression="email = :email",
+                          ExpressionAttributeValues={":email": email.lower()},
+                      )
+                      if response["Items"]:
+                          customer_item = response["Items"][0]
+
+                  # Search by phone using GSI
+                  elif phone:
+                      search_method = "Phone"
+                      normalized_phone = re.sub(r"[\s\-()]", "", phone)
+                      if not normalized_phone.startswith("+"):
+                          normalized_phone = "+1-" + normalized_phone if len(normalized_phone) == 10 else phone
+
+                      response = table.query(
+                          IndexName="phone-index",
+                          KeyConditionExpression="phone = :phone",
+                          ExpressionAttributeValues={":phone": normalized_phone},
+                      )
+                      if response["Items"]:
+                          customer_item = response["Items"][0]
+
+                  if not customer_item:
+                      return f"❌ Customer not found using {search_method}: {customer_id or email or phone}"
+
+                  # Format customer profile response
+                  customer_id_value = customer_item.get("customer_id", "Unknown")
+                  first_name = customer_item.get("first_name", "Unknown")
+                  last_name = customer_item.get("last_name", "Unknown")
+                  email_value = customer_item.get("email", "Not provided")
+                  phone_value = customer_item.get("phone", "Not provided")
+                  tier = customer_item.get("tier", "Standard")
+                  total_purchases = customer_item.get("total_purchases", 0)
+                  lifetime_value = float(customer_item.get("lifetime_value", 0))
+
+                  tier_emoji = {"Standard": "🥉", "Gold": "🥇", "Premium": "💎", "VIP": "👑"}.get(tier, "👤")
+
+                  profile_info = [
+                      "👤 Customer Profile Information",
+                      "===============================",
+                      f"🆔 Customer ID: {customer_id_value}",
+                      f"👤 Name: {first_name} {last_name}",
+                      f"{tier_emoji} Tier: {tier}",
+                      f"📧 Email: {email_value}",
+                      f"📱 Phone: {phone_value}",
+                      f"🛒 Total Purchases: {total_purchases}",
+                      f"💰 Lifetime Value: ${lifetime_value:,.2f}",
+                  ]
+
+                  return "\n".join(profile_info)
+
+              except Exception as e:
+                  logger.error(f"Error getting customer profile: {str(e)}")
+                  return f"❌ Error retrieving customer profile: {str(e)}"
+
+          def check_warranty_status(serial_number, customer_email=None):
+              """Check warranty status for a product"""
+              try:
+                  table = dynamodb.Table(WARRANTY_TABLE_NAME)
+
+                  # Validate serial number format
+                  if not re.match(r"^[A-Z0-9]{8,20}$", serial_number.upper()):
+                      return "❌ Invalid serial number format. Must be 8-20 alphanumeric characters."
+
+                  serial_number = serial_number.upper()
+                  response = table.get_item(Key={"serial_number": serial_number})
+
+                  if "Item" not in response:
+                      return f"❌ Warranty not found for serial number: {serial_number}"
+
+                  warranty_item = response["Item"]
+
+                  # Extract warranty information
+                  product_name = warranty_item.get("product_name", "Unknown Product")
+                  purchase_date = warranty_item.get("purchase_date", "Unknown")
+                  warranty_end_date = warranty_item.get("warranty_end_date", "Unknown")
+                  warranty_type = warranty_item.get("warranty_type", "Standard")
+                  coverage_details = warranty_item.get("coverage_details", "Standard coverage applies")
+
+                  # Calculate days remaining
+                  try:
+                      end_date_obj = datetime.strptime(warranty_end_date, "%Y-%m-%d")
+                      today = datetime.now()
+                      days_remaining = (end_date_obj - today).days
+                  except ValueError:
+                      days_remaining = 0
+
+                  # Determine status
+                  if days_remaining > 30:
+                      status_text = "✅ Active"
+                  elif days_remaining > 0:
+                      status_text = "⚠️ Expiring Soon"
+                  else:
+                      status_text = "❌ Expired"
+
+                  # Format warranty information
+                  warranty_info = [
+                      "🛡️ Warranty Status Information",
+                      "===============================",
+                      f"📱 Product: {product_name}",
+                      f"🔢 Serial Number: {serial_number}",
+                      f"📅 Purchase Date: {purchase_date}",
+                      f"⏰ Warranty End Date: {warranty_end_date}",
+                      f"📋 Warranty Type: {warranty_type}",
+                      f"🔍 Status: {status_text}",
+                      f"📆 Days Remaining: {days_remaining if days_remaining > 0 else 'Expired'}",
+                      "",
+                      "🔧 Coverage Details:",
+                      f"   {coverage_details}",
+                  ]
+
+                  return "\n".join(warranty_info)
+
+              except Exception as e:
+                  logger.error(f"Error checking warranty status: {str(e)}")
+                  return f"❌ Error checking warranty status: {str(e)}"
+
+          def get_order_history(customer_id, limit=5):
+              """Get customer order history"""
+              try:
+                  table = dynamodb.Table(ORDER_TABLE_NAME)
+                  
+                  response = table.query(
+                      IndexName="customer-orders-index",
+                      KeyConditionExpression="customer_id = :customer_id",
+                      ExpressionAttributeValues={":customer_id": customer_id.upper()},
+                      ScanIndexForward=False,  # Sort by date descending
+                      Limit=limit
+                  )
+                  
+                  orders = response.get("Items", [])
+                  
+                  if not orders:
+                      return f"📦 No orders found for customer: {customer_id}"
+                  
+                  order_info = [
+                      f"📦 Order History for Customer: {customer_id}",
+                      "=" * 50
+                  ]
+                  
+                  for i, order in enumerate(orders, 1):
+                      order_id = order.get("order_id", "Unknown")
+                      order_date = order.get("order_date", "Unknown")
+                      status = order.get("status", "Unknown")
+                      total = float(order.get("total_amount", 0))
+                      items = order.get("items", [])
+                      
+                      order_info.extend([
+                          f"{i}. Order #{order_id}",
+                          f"   📅 Date: {order_date}",
+                          f"   📊 Status: {status}",
+                          f"   💰 Total: ${total:,.2f}",
+                          f"   📋 Items: {len(items)} item(s)",
+                          ""
+                      ])
+                  
+                  return "\n".join(order_info)
+                  
+              except Exception as e:
+                  logger.error(f"Error getting order history: {str(e)}")
+                  return f"❌ Error retrieving order history: {str(e)}"
+
+          def lambda_handler(event, context):
+              """Main Lambda handler"""
+              print(f"Event: {event}")
+              print(f"Context: {context}")
+
+              try:
+                  # Extract tool name from context
+                  extended_tool_name = context.client_context.custom["bedrockAgentCoreToolName"]
+                  resource = extended_tool_name.split("___")[1]
+
+                  print(f"Resource: {resource}")
+
+                  if resource == "get_customer_profile":
+                      customer_id = get_named_parameter(event=event, name="customer_id")
+                      email = get_named_parameter(event=event, name="email")
+                      phone = get_named_parameter(event=event, name="phone")
+
+                      if not customer_id and not email and not phone:
+                          return {
+                              "statusCode": 400,
+                              "body": "❌ Please provide customer_id, email, or phone",
+                          }
+
+                      customer_profile = get_customer_profile(
+                          customer_id=customer_id, email=email, phone=phone
+                      )
+
+                      return {
+                          "statusCode": 200,
+                          "body": customer_profile,
+                      }
+
+                  elif resource == "check_warranty_status":
+                      serial_number = get_named_parameter(event=event, name="serial_number")
+                      customer_email = get_named_parameter(event=event, name="customer_email")
+
+                      if not serial_number:
+                          return {
+                              "statusCode": 400,
+                              "body": "❌ Please provide serial_number",
+                          }
+
+                      warranty_status = check_warranty_status(
+                          serial_number=serial_number, customer_email=customer_email
+                      )
+
+                      return {
+                          "statusCode": 200,
+                          "body": warranty_status,
+                      }
+
+                  elif resource == "get_order_history":
+                      customer_id = get_named_parameter(event=event, name="customer_id")
+                      limit = get_named_parameter(event=event, name="limit") or 5
+
+                      if not customer_id:
+                          return {
+                              "statusCode": 400,
+                              "body": "❌ Please provide customer_id",
+                          }
+
+                      order_history = get_order_history(customer_id=customer_id, limit=int(limit))
+
+                      return {
+                          "statusCode": 200,
+                          "body": order_history,
+                      }
+
+                  return {
+                      "statusCode": 400,
+                      "body": f"❌ Unknown tool: {resource}",
+                  }
+
+              except Exception as e:
+                  logger.error(f"Lambda handler error: {str(e)}")
+                  return {
+                      "statusCode": 500,
+                      "body": f"❌ Internal error: {str(e)}",
+                  }
+      Tags:
+        - Key: Application
+          Value: !Ref EnvironmentName
+        - Key: Component
+          Value: CustomerSupport
+
+  # Lambda function to populate sample data
+  PopulateDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${EnvironmentName}-populate-data"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt PopulateDataRole.Arn
+      Timeout: 120
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          from datetime import datetime, timedelta
+          import random
+          from decimal import Decimal
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      dynamodb = boto3.resource('dynamodb')
+                      
+                      customer_table_name = event['ResourceProperties']['CustomerTableName']
+                      warranty_table_name = event['ResourceProperties']['WarrantyTableName']
+                      order_table_name = event['ResourceProperties']['OrderTableName']
+
+                      customer_table = dynamodb.Table(customer_table_name)
+                      warranty_table = dynamodb.Table(warranty_table_name)
+                      order_table = dynamodb.Table(order_table_name)
+
+                      # Sample customer data
+                      customer_data = [
+                          {
+                              'customer_id': 'CUST001',
+                              'first_name': 'John',
+                              'last_name': 'Smith',
+                              'email': 'john.smith@email.com',
+                              'phone': '+1-555-0101',
+                              'tier': 'Premium',
+                              'total_purchases': 3,
+                              'lifetime_value': Decimal('2850.00'),
+                              'registration_date': '2022-11-20'
+                          },
+                          {
+                              'customer_id': 'CUST002',
+                              'first_name': 'Sarah',
+                              'last_name': 'Johnson',
+                              'email': 'sarah.johnson@email.com',
+                              'phone': '+1-555-0102',
+                              'tier': 'Standard',
+                              'total_purchases': 1,
+                              'lifetime_value': Decimal('1299.99'),
+                              'registration_date': '2023-03-15'
+                          },
+                          {
+                              'customer_id': 'CUST003',
+                              'first_name': 'Mike',
+                              'last_name': 'Davis',
+                              'email': 'mike.davis@email.com',
+                              'phone': '+1-555-0103',
+                              'tier': 'Gold',
+                              'total_purchases': 2,
+                              'lifetime_value': Decimal('549.98'),
+                              'registration_date': '2023-08-10'
+                          }
+                      ]
+
+                      # Sample warranty data
+                      warranty_data = [
+                          {
+                              'serial_number': 'ABC12345678',
+                              'customer_id': 'CUST001',
+                              'product_name': 'SmartPhone Pro Max 128GB',
+                              'purchase_date': '2023-01-15',
+                              'warranty_end_date': '2025-01-15',
+                              'warranty_type': 'Extended Warranty',
+                              'coverage_details': 'Full coverage including accidental damage'
+                          },
+                          {
+                              'serial_number': 'MNO33333333',
+                              'customer_id': 'CUST003',
+                              'product_name': 'Gaming Console Pro',
+                              'purchase_date': '2023-11-25',
+                              'warranty_end_date': '2024-11-25',
+                              'warranty_type': 'Gaming Warranty',
+                              'coverage_details': 'Controller issues, overheating protection, and hard drive replacement'
+                          }
+                      ]
+
+                      # Sample order data
+                      order_data = [
+                          {
+                              'order_id': 'ORD001',
+                              'customer_id': 'CUST001',
+                              'order_date': '2023-01-15',
+                              'status': 'Delivered',
+                              'total_amount': Decimal('1299.99'),
+                              'items': [{'product': 'SmartPhone Pro Max', 'quantity': 1}]
+                          },
+                          {
+                              'order_id': 'ORD002',
+                              'customer_id': 'CUST002',
+                              'order_date': '2023-06-20',
+                              'status': 'Delivered',
+                              'total_amount': Decimal('1299.99'),
+                              'items': [{'product': 'Laptop Ultra', 'quantity': 1}]
+                          }
+                      ]
+
+                      # Insert data
+                      with customer_table.batch_writer() as batch:
+                          for item in customer_data:
+                              batch.put_item(Item=item)
+
+                      with warranty_table.batch_writer() as batch:
+                          for item in warranty_data:
+                              batch.put_item(Item=item)
+
+                      with order_table.batch_writer() as batch:
+                          for item in order_data:
+                              batch.put_item(Item=item)
+
+                      print(f"Successfully populated sample data")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # IAM Role for data population Lambda
+  PopulateDataRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBWritePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt CustomerProfileTable.Arn
+                  - !GetAtt WarrantyTable.Arn
+                  - !GetAtt OrderTable.Arn
+
+  # Custom resource to populate sample data
+  PopulateData:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt PopulateDataFunction.Arn
+      CustomerTableName: !Ref CustomerProfileTable
+      WarrantyTableName: !Ref WarrantyTable
+      OrderTableName: !Ref OrderTable
+    DependsOn:
+      - CustomerProfileTable
+      - WarrantyTable
+      - OrderTable
+
+Outputs:
+  CustomerSupportLambdaArn:
+    Description: ARN of the Customer Support Lambda function
+    Value: !GetAtt CustomerSupportLambda.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-CustomerSupportLambdaArn"
+
+  CustomerProfileTableName:
+    Description: Name of the Customer Profile DynamoDB table
+    Value: !Ref CustomerProfileTable
+    Export:
+      Name: !Sub "${EnvironmentName}-CustomerProfileTableName"
+
+  WarrantyTableName:
+    Description: Name of the Warranty DynamoDB table
+    Value: !Ref WarrantyTable
+    Export:
+      Name: !Sub "${EnvironmentName}-WarrantyTableName"
+
+  OrderTableName:
+    Description: Name of the Order DynamoDB table
+    Value: !Ref OrderTable
+    Export:
+      Name: !Sub "${EnvironmentName}-OrderTableName"
+
+  CustomerSupportLambdaRoleArn:
+    Description: ARN of the Customer Support Lambda execution role
+    Value: !GetAtt CustomerSupportLambdaRole.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-CustomerSupportLambdaRoleArn"
