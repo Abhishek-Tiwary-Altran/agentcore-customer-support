@@ -41,7 +41,8 @@ def create_agentcore_gateway(
             name=gateway_name,
             roleArn=gateway_role_arn,
             protocolType="MCP",
-            authorizerType=authorizer_type,
+            authorizerType="AWS_IAM",
+            authorizerConfiguration={},
             description=description
         )
         
@@ -50,6 +51,31 @@ def create_agentcore_gateway(
         
         logger.info(f"✅ Created AgentCore Gateway: {gateway_id}")
         logger.info(f"   Gateway URL: {gateway_url}")
+        
+        # Wait for gateway to be ready
+        logger.info("⏳ Waiting for gateway to be ready...")
+        agentcore_client = boto3.client('bedrock-agentcore-control', region_name=region)
+        
+        max_attempts = 30
+        for attempt in range(max_attempts):
+            try:
+                gateway_status = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
+                status = gateway_status['status']
+                
+                if status == 'AVAILABLE':
+                    logger.info("✅ Gateway is ready")
+                    break
+                elif status in ['FAILED', 'DELETING', 'DELETED']:
+                    raise Exception(f"Gateway creation failed with status: {status}")
+                else:
+                    logger.info(f"Gateway status: {status}, waiting...")
+                    import time
+                    time.sleep(10)
+            except Exception as e:
+                if attempt == max_attempts - 1:
+                    raise Exception(f"Gateway did not become ready after {max_attempts} attempts: {e}")
+                import time
+                time.sleep(10)
         
         return {
             "gateway_id": gateway_id,
@@ -238,7 +264,11 @@ def list_gateway_tools(
         List of tool names
     """
     from strands.tools.mcp.mcp_client import MCPClient
-    from ..infrastructure.lambda-functions.streamable_http_sigv4 import streamablehttp_client_with_sigv4
+    # Note: Import path adjusted for hyphenated directory name
+    import sys
+    import os
+    sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'infrastructure', 'lambda-functions'))
+    from streamable_http_sigv4 import streamablehttp_client_with_sigv4
     
     try:
         # Create MCP client with SigV4 authentication
