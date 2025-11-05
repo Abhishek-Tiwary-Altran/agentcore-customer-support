@@ -16,14 +16,15 @@ sys.path.append('.')
 
 import boto3
 from bedrock_agentcore_starter_toolkit import Runtime
+from config import Config
 
 def load_deployment_info():
     """Load deployment information"""
     try:
-        with open("deployment_info.json", "r") as f:
+        with open(Config.DEPLOYMENT_INFO_FILE, "r") as f:
             return json.load(f)
     except FileNotFoundError:
-        print("❌ deployment_info.json not found. Run deploy.py first.")
+        print(f"❌ {Config.DEPLOYMENT_INFO_FILE} not found. Run deploy.py first.")
         return None
 
 def test_runtime_invocation(deployment_info):
@@ -194,7 +195,8 @@ def test_observability_features(deployment_info):
     
     try:
         # Check CloudWatch logs
-        logs_client = boto3.client('logs', region_name='us-east-1')
+        region = Config.AWS_REGION
+        logs_client = boto3.client('logs', region_name=region)
         
         # Look for agent logs
         log_groups = []
@@ -215,7 +217,7 @@ def test_observability_features(deployment_info):
         
         # Check X-Ray traces (if available)
         try:
-            xray_client = boto3.client('xray', region_name='us-east-1')
+            xray_client = boto3.client('xray', region_name=region)
             
             # Get recent traces
             end_time = datetime.now()
@@ -237,7 +239,7 @@ def test_observability_features(deployment_info):
             print(f"⚠️ Could not access X-Ray traces: {e}")
         
         # Dashboard URL
-        dashboard_url = "https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#gen-ai-observability/agent-core"
+        dashboard_url = f"https://console.aws.amazon.com/cloudwatch/home?region={region}#gen-ai-observability/agent-core"
         print(f"\n🎯 GenAI Observability Dashboard: {dashboard_url}")
         
         print("\n✅ Observability validation completed")
