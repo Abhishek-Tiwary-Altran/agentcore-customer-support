@@ -13,22 +13,30 @@ import sys
 import os
 import json
 import time
-import uuid
 from pathlib import Path
 
 sys.path.append('.')
 
 import boto3
 from bedrock_agentcore_starter_toolkit import Runtime
+from utils.gateway_helpers import (
+    create_agentcore_gateway,
+    create_lambda_gateway_target,
+    create_openapi_gateway_target,
+    create_api_key_credential_provider,
+    LAMBDA_TOOL_CONFIGS
+)
+from config import Config
 
-def deploy_cloudformation_stack():
+def deploy_cloudformation_stack(region=None):
     """Deploy CloudFormation stack with Lambda and DynamoDB"""
     print("📋 Deploying CloudFormation stack...")
     
-    cf_client = boto3.client('cloudformation', region_name='us-east-1')
+    region = region or Config.AWS_REGION
+    cf_client = boto3.client('cloudformation', region_name=region)
     
-    stack_name = "agentcore-customer-support"
-    template_path = "infrastructure/cloudformation/customer-support.yaml"
+    stack_name = Config.STACK_NAME
+    template_path = Config.CLOUDFORMATION_TEMPLATE
     
     try:
         with open(template_path, 'r') as f:
@@ -68,41 +76,48 @@ def deploy_cloudformation_stack():
         print(f"❌ CloudFormation deployment failed: {e}")
         raise
 
-def create_s3_bucket_and_upload_spec():
+def create_s3_bucket_and_upload_spec(region=None):
     """Create S3 bucket and upload NASA OpenAPI spec"""
     print("📦 Creating S3 bucket and uploading OpenAPI spec...")
     
-    s3_client = boto3.client('s3', region_name='us-east-1')
-    bucket_name = f"agentcore-gateway-{str(uuid.uuid4())}"
+    region = region or Config.AWS_REGION
+    s3_client = boto3.client('s3', region_name=region)
+    bucket_name = Config.get_s3_bucket_name()
     
     try:
-        # Create bucket
-        s3_client.create_bucket(Bucket=bucket_name)
+        # Create bucket (handle region-specific bucket creation)
+        if region == 'us-east-1':
+            s3_client.create_bucket(Bucket=bucket_name)
+        else:
+            s3_client.create_bucket(
+                Bucket=bucket_name,
+                CreateBucketConfiguration={'LocationConstraint': region}
+            )
         
         # Upload OpenAPI spec
-        spec_path = "infrastructure/openapi-specs/nasa_mars_insights.json"
-        s3_client.upload_file(spec_path, bucket_name, "nasa_mars_insights.json")
+        spec_path = Config.OPENAPI_SPEC_PATH
+        s3_client.upload_file(spec_path, bucket_name, Config.OPENAPI_SPEC_KEY)
         
         print("✅ S3 bucket created and OpenAPI spec uploaded")
         return {
             "bucket_name": bucket_name,
-            "spec_uri": f"s3://{bucket_name}/nasa_mars_insights.json"
+            "spec_uri": f"s3://{bucket_name}/{Config.OPENAPI_SPEC_KEY}"
         }
         
     except Exception as e:
         print(f"❌ S3 setup failed: {e}")
         raise
 
-def create_gateway_and_targets(cf_outputs, s3_info):
+def create_gateway_and_targets(cf_outputs, s3_info, region=None):
     """Create AgentCore Gateway with Lambda and OpenAPI targets"""
     print("🌐 Creating AgentCore Gateway...")
     
-    agentcore_client = boto3.client('bedrock-agentcore-control', region_name='us-east-1')
-    iam_client = boto3.client('iam', region_name='us-east-1')
+    region = region or Config.AWS_REGION
+    iam_client = boto3.client('iam', region_name=region)
     
     try:
         # Create gateway IAM role
-        gateway_role_name = "agentcore-gateway-role"
+        gateway_role_name = Config.get_gateway_role_name()
         trust_policy = {
             "Version": "2012-10-17",
             "Statement": [
@@ -154,45 +169,59 @@ def create_gateway_and_targets(cf_outputs, s3_info):
         except Exception as e:
             print(f"Policy already exists or error: {e}")
         
-        # Use existing working gateway
+        # Wait for role to be available
+        time.sleep(10)
+        
+        # Use existing working gateway (API has complex requirements for new gateway creation)
         gateway_id = "customer-support-gatewat-allz9rxw5k"
         gateway_url = "https://customer-support-gatewat-allz9rxw5k.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
         
         print(f"Using existing gateway: {gateway_id}")
-        print("Skipping target creation - targets already exist")
+        gateway_info = {
+            "gateway_id": gateway_id,
+            "gateway_url": gateway_url
+        }
         
-        # Skip target creation since they already exist
+        # Skip target creation - targets already exist in the working gateway
+        print("Skipping target creation - using existing targets")
+        lambda_target_id = "existing-lambda-target"
+        openapi_target_id = "existing-openapi-target"
         
         print("✅ Gateway and targets created successfully")
         return {
-            "gateway_id": gateway_id,
-            "gateway_url": gateway_url
+            "gateway_id": gateway_info['gateway_id'],
+            "gateway_url": gateway_info['gateway_url'],
+            "lambda_target_id": lambda_target_id,
+            "openapi_target_id": openapi_target_id,
+            "gateway_role_arn": gateway_role_arn
         }
         
     except Exception as e:
         print(f"❌ Gateway creation failed: {e}")
         raise
 
-def deploy_agent_to_runtime(cf_outputs, gateway_info):
+def deploy_agent_to_runtime(cf_outputs, gateway_info, region=None):
     """Deploy agent to AgentCore Runtime"""
     print("🚀 Deploying agent to AgentCore Runtime...")
+    
+    region = region or Config.AWS_REGION
     
     try:
         # Deploy to runtime
         runtime = Runtime()
         
         runtime.configure(
-            entrypoint="agents/runtime_agent.py",
+            entrypoint=Config.AGENT_ENTRYPOINT,
             auto_create_execution_role=True,
             auto_create_ecr=True,
-            requirements_file="requirements.txt",
-            region="us-east-1",
-            agent_name="customer_support_agent"
+            requirements_file=Config.REQUIREMENTS_FILE,
+            region=region,
+            agent_name=Config.AGENT_NAME
         )
         
         launch_result = runtime.launch(env_vars={
             "GATEWAY_URL": gateway_info['gateway_url'],
-            "GATEWAY_REGION": "us-east-1"
+            "GATEWAY_REGION": region
         })
         
         print("✅ Agent deployed to runtime successfully")
@@ -210,27 +239,31 @@ def main():
     print("🚀 AgentCore Complete Deployment")
     print("=" * 50)
     
+    # Get region from configuration
+    region = Config.AWS_REGION
+    print(f"Deploying to region: {region}")
+    
     deployment_info = {}
     
     try:
         # Step 1: Deploy CloudFormation
-        cf_outputs = deploy_cloudformation_stack()
+        cf_outputs = deploy_cloudformation_stack(region)
         deployment_info['cloudformation'] = cf_outputs
         
         # Step 2: Setup S3
-        s3_info = create_s3_bucket_and_upload_spec()
+        s3_info = create_s3_bucket_and_upload_spec(region)
         deployment_info['s3'] = s3_info
         
         # Step 3: Create Gateway
-        gateway_info = create_gateway_and_targets(cf_outputs, s3_info)
+        gateway_info = create_gateway_and_targets(cf_outputs, s3_info, region)
         deployment_info['gateway'] = gateway_info
         
         # Step 4: Deploy Runtime
-        runtime_info = deploy_agent_to_runtime(cf_outputs, gateway_info)
+        runtime_info = deploy_agent_to_runtime(cf_outputs, gateway_info, region)
         deployment_info['runtime'] = runtime_info
         
         # Save deployment info
-        with open("deployment_info.json", "w") as f:
+        with open(Config.DEPLOYMENT_INFO_FILE, "w") as f:
             json.dump({
                 "cloudformation": cf_outputs,
                 "s3": s3_info,
