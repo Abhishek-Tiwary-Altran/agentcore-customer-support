@@ -17,14 +17,15 @@ import boto3
 from pathlib import Path
 
 sys.path.append('.')
+from config import Config
 
 def load_deployment_info():
     """Load deployment information from file"""
     try:
-        with open("deployment_info.json", "r") as f:
+        with open(Config.DEPLOYMENT_INFO_FILE, "r") as f:
             return json.load(f)
     except FileNotFoundError:
-        print("❌ deployment_info.json not found. Run deploy.py first.")
+        print(f"❌ {Config.DEPLOYMENT_INFO_FILE} not found. Run deploy.py first.")
         return None
     except Exception as e:
         print(f"❌ Error loading deployment info: {e}")
@@ -34,130 +35,163 @@ def cleanup_runtime(deployment_info):
     """Clean up AgentCore Runtime and ECR"""
     print("🚀 Cleaning up AgentCore Runtime...")
     
+    region = Config.AWS_REGION
+    agentcore_client = boto3.client('bedrock-agentcore-control', region_name=region)
+    ecr_client = boto3.client('ecr', region_name=region)
+    
+    # Delete runtime if exists in deployment info
+    if 'runtime' in deployment_info and 'agent_arn' in deployment_info['runtime']:
+        agent_arn = deployment_info['runtime']['agent_arn']
+        agent_id = agent_arn.split('/')[-1]
+        try:
+            agentcore_client.delete_agent_runtime(agentRuntimeId=agent_id)
+            print(f"✅ Runtime deleted: {agent_id}")
+        except Exception as e:
+            print(f"⚠️ Could not delete runtime {agent_id}: {e}")
+    
+    # Delete ECR repository
+    try:
+        repo_name = f"bedrock-agentcore-{Config.AGENT_NAME}"
+        ecr_client.delete_repository(repositoryName=repo_name, force=True)
+        print(f"✅ ECR repository deleted: {repo_name}")
+    except ecr_client.exceptions.RepositoryNotFoundException:
+        print("ℹ️ ECR repository not found")
+    except Exception as e:
+        print(f"⚠️ Could not delete ECR repository: {e}")
+    
+    # Try Runtime toolkit cleanup as fallback
     try:
         from bedrock_agentcore_starter_toolkit import Runtime
-        from bedrock_agentcore_starter_toolkit.operations.runtime import destroy_bedrock_agentcore
-        
-        # Delete runtime using toolkit
-        destroy_bedrock_agentcore(
-            config_path=Path(".bedrock_agentcore.yaml"),
-            agent_name="customer-support-agent",
-            delete_ecr_repo=True
-        )
-        
-        print("✅ Runtime and ECR cleaned up")
-        
+        runtime = Runtime()
+        runtime.destroy(delete_ecr_repo=False)  # ECR already handled above
+        print("✅ Runtime toolkit cleanup completed")
     except Exception as e:
-        print(f"⚠️ Runtime cleanup warning: {e}")
-        
-        # Fallback: try direct API cleanup
-        try:
-            agentcore_client = boto3.client('bedrock-agentcore-control', region_name='us-east-1')
-            ecr_client = boto3.client('ecr', region_name='us-east-1')
-            
-            # Try to delete runtime directly
-            if 'runtime' in deployment_info and 'agent_arn' in deployment_info['runtime']:
-                agent_id = deployment_info['runtime']['agent_arn'].split('/')[-1]
-                try:
-                    agentcore_client.delete_agent_runtime(agentRuntimeId=agent_id)
-                    print("✅ Runtime deleted via API")
-                except:
-                    pass
-            
-            # Try to delete ECR repository
-            try:
-                ecr_client.delete_repository(
-                    repositoryName="bedrock-agentcore-customer-support-agent",
-                    force=True
-                )
-                print("✅ ECR repository deleted")
-            except:
-                pass
-                
-        except Exception as fallback_error:
-            print(f"⚠️ Fallback runtime cleanup failed: {fallback_error}")
+        print(f"⚠️ Runtime toolkit cleanup warning: {e}")
 
 def cleanup_gateway(deployment_info):
     """Clean up AgentCore Gateway and targets"""
     print("🌐 Cleaning up AgentCore Gateway...")
     
-    try:
-        agentcore_client = boto3.client('bedrock-agentcore-control', region_name='us-east-1')
+    region = Config.AWS_REGION
+    agentcore_client = boto3.client('bedrock-agentcore-control', region_name=region)
+    
+    if 'gateway' in deployment_info:
+        gateway_id = deployment_info['gateway']['gateway_id']
         
-        if 'gateway' in deployment_info:
-            gateway_id = deployment_info['gateway']['gateway_id']
-            
+        # Skip deletion of shared/existing gateway
+        if gateway_id == "customer-support-gatewat-allz9rxw5k":
+            print("ℹ️ Skipping deletion of shared gateway")
+        else:
             # List and delete targets first
             try:
                 targets = agentcore_client.list_gateway_targets(gatewayIdentifier=gateway_id)
                 for target in targets.get('items', []):
-                    agentcore_client.delete_gateway_target(
-                        gatewayIdentifier=gateway_id,
-                        targetIdentifier=target['targetId']
-                    )
-                    print(f"✅ Deleted gateway target: {target['name']}")
+                    target_id = target.get('targetId') or target.get('id')
+                    target_name = target.get('name', target_id)
+                    try:
+                        agentcore_client.delete_gateway_target(
+                            gatewayIdentifier=gateway_id,
+                            targetId=target_id
+                        )
+                        print(f"✅ Deleted gateway target: {target_name}")
+                    except Exception as e:
+                        print(f"⚠️ Could not delete target {target_name}: {e}")
             except Exception as e:
                 print(f"⚠️ Target cleanup warning: {e}")
             
             # Delete gateway
-            agentcore_client.delete_gateway(gatewayIdentifier=gateway_id)
-            print("✅ Gateway deleted")
-        
-        # Clean up API key credential provider
+            try:
+                agentcore_client.delete_gateway(gatewayIdentifier=gateway_id)
+                print(f"✅ Gateway deleted: {gateway_id}")
+            except Exception as e:
+                print(f"⚠️ Could not delete gateway {gateway_id}: {e}")
+    
+    # Clean up IAM role created for gateway
+    if 'gateway' in deployment_info and 'gateway_role_arn' in deployment_info['gateway']:
         try:
-            agentcore_client.delete_api_key_credential_provider(name="NasaAPIKey")
-            print("✅ API key credential provider deleted")
-        except Exception as e:
-            print(f"⚠️ Credential provider cleanup warning: {e}")
+            iam_client = boto3.client('iam', region_name=region)
+            role_arn = deployment_info['gateway']['gateway_role_arn']
+            role_name = role_arn.split('/')[-1]
             
-    except Exception as e:
-        print(f"⚠️ Gateway cleanup warning: {e}")
+            # Delete inline policy first
+            try:
+                iam_client.delete_role_policy(RoleName=role_name, PolicyName="GatewayPolicy")
+            except Exception:
+                pass
+            
+            # Delete role
+            iam_client.delete_role(RoleName=role_name)
+            print(f"✅ Gateway IAM role deleted: {role_name}")
+        except Exception as e:
+            print(f"⚠️ Could not delete gateway IAM role: {e}")
 
 def cleanup_s3(deployment_info):
     """Clean up S3 bucket and objects"""
     print("📦 Cleaning up S3 bucket...")
     
-    try:
-        s3_client = boto3.client('s3', region_name='us-east-1')
+    region = Config.AWS_REGION
+    s3_client = boto3.client('s3', region_name=region)
+    
+    if 's3' in deployment_info and 'bucket_name' in deployment_info['s3']:
+        bucket_name = deployment_info['s3']['bucket_name']
         
-        if 's3' in deployment_info:
-            bucket_name = deployment_info['s3']['bucket_name']
-            
-            # Delete all objects
+        try:
+            # Delete all objects first
             try:
                 objects = s3_client.list_objects_v2(Bucket=bucket_name)
                 if 'Contents' in objects:
                     for obj in objects['Contents']:
                         s3_client.delete_object(Bucket=bucket_name, Key=obj['Key'])
                         print(f"✅ Deleted object: {obj['Key']}")
+            except s3_client.exceptions.NoSuchBucket:
+                print(f"ℹ️ S3 bucket not found: {bucket_name}")
+                return
             except Exception as e:
                 print(f"⚠️ Object deletion warning: {e}")
             
             # Delete bucket
-            s3_client.delete_bucket(Bucket=bucket_name)
-            print(f"✅ S3 bucket deleted: {bucket_name}")
-            
-    except Exception as e:
-        print(f"⚠️ S3 cleanup warning: {e}")
+            try:
+                s3_client.delete_bucket(Bucket=bucket_name)
+                print(f"✅ S3 bucket deleted: {bucket_name}")
+            except s3_client.exceptions.NoSuchBucket:
+                print(f"ℹ️ S3 bucket already deleted: {bucket_name}")
+            except Exception as e:
+                print(f"⚠️ Could not delete S3 bucket: {e}")
+                
+        except Exception as e:
+            print(f"⚠️ S3 cleanup warning: {e}")
+    else:
+        print("ℹ️ No S3 bucket information found")
 
 def cleanup_cloudformation(deployment_info):
     """Clean up CloudFormation stack"""
     print("📋 Cleaning up CloudFormation stack...")
     
+    region = Config.AWS_REGION
+    cf_client = boto3.client('cloudformation', region_name=region)
+    stack_name = Config.STACK_NAME
+    
     try:
-        cf_client = boto3.client('cloudformation', region_name='us-east-1')
-        
-        stack_name = "agentcore-customer-support"
+        # Check if stack exists
+        try:
+            cf_client.describe_stacks(StackName=stack_name)
+        except cf_client.exceptions.ClientError as e:
+            if 'does not exist' in str(e):
+                print(f"ℹ️ CloudFormation stack not found: {stack_name}")
+                return
+            raise
         
         # Delete stack
         cf_client.delete_stack(StackName=stack_name)
+        print(f"⏳ Deleting CloudFormation stack: {stack_name}")
         
-        # Wait for deletion
-        waiter = cf_client.get_waiter('stack_delete_complete')
-        print("⏳ Waiting for stack deletion...")
-        waiter.wait(StackName=stack_name, WaiterConfig={'Delay': 30, 'MaxAttempts': 20})
-        
-        print("✅ CloudFormation stack deleted")
+        # Wait for deletion with timeout
+        try:
+            waiter = cf_client.get_waiter('stack_delete_complete')
+            waiter.wait(StackName=stack_name, WaiterConfig={'Delay': 30, 'MaxAttempts': 20})
+            print(f"✅ CloudFormation stack deleted: {stack_name}")
+        except Exception as e:
+            print(f"⚠️ Stack deletion may still be in progress: {e}")
         
     except Exception as e:
         print(f"⚠️ CloudFormation cleanup warning: {e}")
@@ -167,7 +201,7 @@ def cleanup_local_files():
     print("🧹 Cleaning up local files...")
     
     files_to_remove = [
-        "deployment_info.json",
+        Config.DEPLOYMENT_INFO_FILE,
         "runtime_agent.py",
         ".bedrock_agentcore.yaml",
         "Dockerfile",
@@ -200,38 +234,32 @@ def main():
         print(f"  - Runtime: {deployment_info['runtime']['agent_arn']}")
     if 's3' in deployment_info:
         print(f"  - S3 Bucket: {deployment_info['s3']['bucket_name']}")
-    print("  - CloudFormation stack: agentcore-customer-support")
+    print(f"  - CloudFormation stack: {Config.STACK_NAME}")
     
     confirm = input("\nAre you sure you want to proceed? (yes/no): ").strip().lower()
     if confirm not in ['yes', 'y']:
         print("Cleanup cancelled.")
         return 0
     
-    try:
-        # Step 1: Clean up Runtime (first, as it depends on other resources)
-        cleanup_runtime(deployment_info)
-        
-        # Step 2: Clean up Gateway
-        cleanup_gateway(deployment_info)
-        
-        # Step 3: Clean up S3
-        cleanup_s3(deployment_info)
-        
-        # Step 4: Clean up CloudFormation (last, as other resources depend on it)
-        cleanup_cloudformation(deployment_info)
-        
-        # Step 5: Clean up local files
-        cleanup_local_files()
-        
-        print("\n🎉 Cleanup completed successfully!")
-        print("All AgentCore resources have been removed.")
-        
-        return 0
-        
-    except Exception as e:
-        print(f"\n❌ Cleanup failed: {e}")
-        print("Some resources may need manual cleanup.")
-        return 1
+    # Step 1: Clean up Runtime (first, as it depends on other resources)
+    cleanup_runtime(deployment_info)
+    
+    # Step 2: Clean up Gateway
+    cleanup_gateway(deployment_info)
+    
+    # Step 3: Clean up S3
+    cleanup_s3(deployment_info)
+    
+    # Step 4: Clean up CloudFormation (last, as other resources depend on it)
+    cleanup_cloudformation(deployment_info)
+    
+    # Step 5: Clean up local files
+    cleanup_local_files()
+    
+    print("\n🎉 Cleanup completed!")
+    print("All AgentCore resources have been processed.")
+    
+    return 0
 
 if __name__ == "__main__":
     exit(main())
