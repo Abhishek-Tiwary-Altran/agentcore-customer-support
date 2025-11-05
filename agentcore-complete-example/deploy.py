@@ -178,67 +178,11 @@ def deploy_agent_to_runtime(cf_outputs, gateway_info):
     print("🚀 Deploying agent to AgentCore Runtime...")
     
     try:
-        # Create agent file for runtime
-        agent_code = f'''
-from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from strands import Agent, tool
-from strands.models import BedrockModel
-from strands.tools.mcp.mcp_client import MCPClient
-from streamable_http_sigv4 import streamablehttp_client_with_sigv4
-import boto3
-
-app = BedrockAgentCoreApp()
-
-def create_mcp_client():
-    session = boto3.Session()
-    credentials = session.get_credentials()
-    
-    return MCPClient(
-        lambda: streamablehttp_client_with_sigv4(
-            url="{gateway_info['gateway_url']}",
-            credentials=credentials,
-            service="bedrock-agentcore",
-            region="us-east-1"
-        )
-    )
-
-mcp_client = create_mcp_client()
-mcp_client.start()
-
-def get_tools():
-    tools = []
-    try:
-        tool_list = mcp_client.list_tools_sync()
-        tools.extend(tool_list)
-    except:
-        pass
-    return tools
-
-model = BedrockModel(model_id="us.anthropic.claude-3-7-sonnet-20250219-v1:0")
-agent = Agent(
-    model=model,
-    tools=get_tools(),
-    system_prompt="You are a customer support agent with access to customer data and Mars weather information."
-)
-
-@app.entrypoint
-def customer_support_agent(payload):
-    user_input = payload.get("prompt")
-    response = agent(user_input)
-    return response.message['content'][0]['text']
-
-if __name__ == "__main__":
-    app.run()
-'''
-        
-        with open("runtime_agent.py", "w") as f:
-            f.write(agent_code)
-        
         # Deploy to runtime
         runtime = Runtime()
         
         runtime.configure(
-            entrypoint="runtime_agent.py",
+            entrypoint="agents/runtime_agent.py",
             auto_create_execution_role=True,
             auto_create_ecr=True,
             requirements_file="requirements.txt",
