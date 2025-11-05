@@ -392,63 +392,26 @@ def cleanup_memory_resources(
             logger.error(f"❌ Failed to delete memory {memory_id}: {e}")
 
 
-# Example memory configurations for different use cases
-MEMORY_CONFIGS = {
-    "personal_assistant": {
-        "strategies": [
-            {
-                "type": "semantic",
-                "name": "PersonalFacts",
-                "description": "Personal information and preferences",
-                "namespaces": ["personal/{actorId}/facts"]
-            },
-            {
-                "type": "user_preference",
-                "name": "UserPreferences",
-                "description": "User behavior and preferences",
-                "namespaces": ["personal/{actorId}/preferences"]
-            }
-        ],
-        "retention_days": 30
-    },
-    "customer_support": {
-        "strategies": [
-            {
-                "type": "semantic",
-                "name": "SupportHistory",
-                "description": "Customer issues and resolutions",
-                "namespaces": ["support/{actorId}/history"]
-            },
-            {
-                "type": "user_preference",
-                "name": "CustomerProfile",
-                "description": "Customer preferences and communication style",
-                "namespaces": ["support/{actorId}/profile"]
-            }
-        ],
-        "retention_days": 365
-    },
-    "educational_tutor": {
-        "strategies": [
-            {
-                "type": "semantic",
-                "name": "LearningProgress",
-                "description": "Student learning progress and knowledge gaps",
-                "namespaces": ["education/{actorId}/progress"]
-            },
-            {
-                "type": "user_preference",
-                "name": "LearningStyle",
-                "description": "Student learning preferences and style",
-                "namespaces": ["education/{actorId}/style"]
-            },
-            {
-                "type": "summary",
-                "name": "SessionSummary",
-                "description": "Learning session summaries",
-                "namespaces": ["education/{actorId}/sessions"]
-            }
-        ],
-        "retention_days": 180
-    }
+# Customer support memory configuration
+CUSTOMER_SUPPORT_MEMORY_CONFIG = {
+    "strategies": [
+        {
+            "type": "semantic",
+            "name": "SupportHistory",
+            "description": "Customer issues and resolutions",
+            "namespaces": ["support/{actorId}/history"]
+        },
+        {
+            "type": "user_preference",
+            "name": "CustomerProfile",
+            "description": "Customer preferences and communication style",
+            "namespaces": ["support/{actorId}/profile"]
+        }
+    ],
+    "retention_days": 365
 }
+
+
+def get_customer_support_memory_config() -> Dict[str, Any]:
+    """Get optimized memory configuration for customer support use case."""
+    return CUSTOMER_SUPPORT_MEMORY_CONFIG.copy()
